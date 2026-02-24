@@ -17,4 +17,4 @@ app/schemas/_init__.py
 app/services/loan_service.py
 app/services/loan_store.py
 app/services/loan.py
-.myenv
+*.myenv/
