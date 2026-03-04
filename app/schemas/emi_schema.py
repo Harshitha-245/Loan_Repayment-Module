@@ -5,7 +5,7 @@ from .base_schema import BaseSchema
 
 
 class EMIScheduleSchema(BaseSchema):
-    emi_id: Optional[UUID] = None
+    emi_id: Optional[UUID] = None 
     loan_id: UUID
     emi_number: int
     due_date: date

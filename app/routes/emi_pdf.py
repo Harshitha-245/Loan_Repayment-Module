@@ -7,7 +7,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from app.core.db import get_db
-from app.models.emi_scheduled import EMI_Schedule
+from app.models.emi_scheduled import EMISchedule
 
 router = APIRouter(prefix="/emi-pdf",tags=["EMI Schedule"])
 
@@ -15,18 +15,15 @@ router = APIRouter(prefix="/emi-pdf",tags=["EMI Schedule"])
 def download_emi_pdf(loan_id: str, db: Session = Depends(get_db)):
 
     emis = (
-        db.query(EMI_Schedule)
-        .filter(EMI_Schedule.application_id == loan_id)
-        .order_by(EMI_Schedule.emi_number.asc())
+        db.query(EMISchedule)
+        .filter(EMISchedule.application_id == loan_id)
+        .order_by(EMISchedule.emi_number.asc())
         .all()
     )
 
     if not emis:
         raise HTTPException(status_code=404, detail="No EMI schedule found")
-
-    # ✅ PDF file path
-    file_path = f"EMI_Schedule_{loan_id}.pdf"
-
+    file_path = f"EMISchedule_{loan_id}.pdf"
     doc = SimpleDocTemplate(
         file_path,
         pagesize=landscape(A4),
@@ -39,7 +36,6 @@ def download_emi_pdf(loan_id: str, db: Session = Depends(get_db)):
     styles = getSampleStyleSheet()
     elements = []
 
-    # ✅ Custom styles
     title_style = ParagraphStyle(
         name="TitleStyle",
         fontSize=22,
@@ -65,14 +61,10 @@ def download_emi_pdf(loan_id: str, db: Session = Depends(get_db)):
         spaceAfter=6,
         leading=18
     )
-
-    # ✅ Title section
     elements.append(Paragraph("EMI Repayment Schedule", title_style))
     elements.append(Spacer(1, 10))
     elements.append(Paragraph(f"Loan ID: <b>{loan_id}</b>", subtitle_style))
     elements.append(Spacer(1, 8))
-
-    # ✅ Table header
     table_data = [[
         "EMI No.",
         "Due Date",
@@ -104,8 +96,6 @@ def download_emi_pdf(loan_id: str, db: Session = Depends(get_db)):
         total_principal += float(emi.principal_component)
         total_interest  += float(emi.interest_component)
         total_gst       += float(emi.gst_amount)
-
-    # Totals row
     table_data.append([
         "Total", "",
         "",
@@ -168,8 +158,6 @@ def download_emi_pdf(loan_id: str, db: Session = Depends(get_db)):
 
     elements.append(table)
     elements.append(Spacer(1, 16))
-
-    # ✅ Centered summary below table
     summary_style = ParagraphStyle(
         name="SummaryStyle",
         fontSize=11,

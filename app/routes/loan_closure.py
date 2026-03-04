@@ -1,350 +1,432 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from io import BytesIO
-from datetime import datetime, timedelta
-from reportlab.lib.pagesizes import letter
+from decimal import Decimal
+from datetime import datetime
+
+from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import inch
+from reportlab.lib.units import cm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table,
-    TableStyle, HRFlowable, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer,
+    Table, TableStyle, HRFlowable
 )
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+
 from app.core.db import get_db
-from app.models.loans import Loan
+from app.models.loans import LoanApplication
+from app.models.emi_scheduled import EMISchedule
 from app.models.payments import Payment_Transaction
-from app.models.emi_scheduled import EMI_Schedule
+from app.models.lender_table import Lender
 
-router = APIRouter(prefix="/loan-closure", tags=["Loan Closure and NDC certificate"])
+router = APIRouter(prefix="/payments", tags=["Loan Closure & Credit Bureau Update Notice"])
+GST_RATE         = Decimal('0.18')
+FORECLOSURE_RATE = Decimal('0.04')
+NAVY    = colors.HexColor('#1A3C5E')
+BLUE    = colors.HexColor('#2E7DAF')
+LIGHT   = colors.HexColor('#EEF3F8')
+ALT     = colors.HexColor('#F7FAFC')
+BORDER  = colors.HexColor('#CBD5E0')
+GREEN   = colors.HexColor('#1E7E4A')
+AMBER   = colors.HexColor('#B45309')
+WHITE   = colors.white
+GREY    = colors.HexColor('#718096')
+DARK    = colors.HexColor('#2D3748')
 
-# ── NBFC Config ───────────────────────────────────────────────────────────────
+def _fmt(val) -> str:
+    try:
+        return f"Rs. {float(val):,.2f}"
+    except Exception:
+        return str(val or "-")
 
-NBFC_NAME    = "ABC Finance Private Limited"
-NBFC_ADDRESS = "123, Financial District, Hyderabad - 500032, Telangana"
-NBFC_CONTACT = "Phone: 040-12345678 | Email: support@abcfinance.in"
-NBFC_REG     = "NBFC Reg No: N-07.00000.00.000 | RBI Reg No: B-01.00000"
+def _fmtn(val) -> str:
+    try:
+        return f"{float(val):,.2f}"
+    except Exception:
+        return str(val or "0.00")
 
-# ── Dummy Bank Details ────────────────────────────────────────────────────────
+def _style(name, **kwargs) -> ParagraphStyle:
+    base = dict(fontName='Helvetica', fontSize=9, textColor=DARK, leading=13)
+    base.update(kwargs)
+    return ParagraphStyle(name, **base)
 
-DUMMY_BANK = {
-    "bank_name":      "State Bank of India",
-    "branch_name":    "Hyderabad Main Branch",
-    "account_number": "456789123456",
-    "ifsc_code":      "SBIN0002456",
-}
+def _kv_table(rows: list[tuple], col_w=(7*cm, 8*cm)) -> Table:
+    data = []
+    for k, v in rows:
+        data.append([
+            Paragraph(k, _style('k', fontName='Helvetica-Bold', fontSize=8.5, textColor=NAVY)),
+            Paragraph(str(v), _style('v', fontSize=8.5, textColor=DARK)),
+        ])
+    t = Table(data, colWidths=col_w)
+    t.setStyle(TableStyle([
+        ('TOPPADDING',    (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('LEFTPADDING',   (0,0), (-1,-1), 8),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 8),
+        ('ROWBACKGROUNDS',(0,0), (-1,-1), [WHITE, ALT]),
+        ('GRID',          (0,0), (-1,-1), 0.4, BORDER),
+        ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    return t
 
-# ── Color Palette ─────────────────────────────────────────────────────────────
-
-PRIMARY   = colors.HexColor('#1B3A6B')
-GREEN     = colors.HexColor('#1B7B34')
-LIGHT_BG  = colors.HexColor('#EEF2F8')
-ROW_ALT   = colors.HexColor('#F7F9FC')
-GREY      = colors.HexColor('#CCCCCC')
-TEXT_DARK = colors.HexColor('#222222')
-TEXT_MID  = colors.HexColor('#444444')
-TEXT_LITE = colors.HexColor('#888888')
-
-# ── Styles ────────────────────────────────────────────────────────────────────
-
-def get_styles():
-    styles = getSampleStyleSheet()
-
-    defs = [
-        ('nbfc_name',     'Helvetica-Bold',    18, PRIMARY,   TA_CENTER, 4,  0),
-        ('nbfc_address',  'Helvetica',          9, TEXT_MID,  TA_CENTER, 2,  0),
-        ('nbfc_reg',      'Helvetica-Oblique',  8, TEXT_LITE, TA_CENTER, 2,  0),
-        ('doc_title',     'Helvetica-Bold',    14, PRIMARY,   TA_CENTER, 6, 10),
-        ('ref_line',      'Helvetica',          9, colors.HexColor('#333333'), TA_LEFT, 2, 0),
-        ('body_text',     'Helvetica',         10, TEXT_DARK, TA_JUSTIFY, 8,  0),
-        ('section_header','Helvetica-Bold',    11, PRIMARY,   TA_LEFT,   4, 10),
-        ('footer_text',   'Helvetica-Oblique',  8, TEXT_LITE, TA_CENTER, 0,  0),
-        ('sign_label',    'Helvetica',          9, colors.HexColor('#333333'), TA_LEFT, 0, 0),
-        ('sign_name',     'Helvetica-Bold',    10, PRIMARY,   TA_LEFT,   0,  0),
-    ]
-
-    for name, font, size, color, align, after, before in defs:
-        styles.add(ParagraphStyle(
-            name, fontName=font, fontSize=size, textColor=color,
-            alignment=align, spaceAfter=after, spaceBefore=before,
-            **({"leading": 16} if name == "body_text" else {})
-        ))
-
-    return styles
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def format_date(dt=None):
-    return (dt or datetime.utcnow()).strftime("%d %B %Y")
-
-def ref_no(prefix, application_id, dt=None):
-    return f"REF/{prefix}/{(dt or datetime.utcnow()).strftime('%Y%m%d')}/{str(application_id)[:8].upper()}"
-
-def loan_info(loan):
-    """Extract loan fields with safe fallbacks."""
-    def get(attr, fallback):
-        return getattr(loan, attr, None) or fallback
-
-    bank = DUMMY_BANK
-    return {
-        "borrower_name":  get("borrower_name",       "Valued Customer"),
-        "loan_amount":    get("loan_amount",          "N/A"),
-        "bank_name":      get("bank_name",            bank["bank_name"]),
-        "account_number": get("bank_account_number",  bank["account_number"]),
-        "ifsc_code":      get("ifsc_code",            bank["ifsc_code"]),
-        "branch_name":    get("branch_name",          bank["branch_name"]),
-    }
-
-def base_table_style(header_row=False):
-    style = [
-        ('FONTNAME',  (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTNAME',  (1, 0), (1, -1), 'Helvetica'),
-        ('FONTSIZE',  (0, 0), (-1, -1), 10),
-        ('GRID',      (0, 0), (-1, -1), 0.5, GREY),
-        ('PADDING',   (0, 0), (-1, -1), 7),
-        ('VALIGN',    (0, 0), (-1, -1), 'MIDDLE'),
-        ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.white, ROW_ALT]),
-    ]
-    if header_row:
-        style += [
-            ('BACKGROUND', (0, 0), (-1, 0), PRIMARY),
-            ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
-            ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('ALIGN',      (0, 0), (-1, 0), 'CENTER'),
-        ]
-    else:
-        style.append(('BACKGROUND', (0, 0), (0, -1), LIGHT_BG))
-    return TableStyle(style)
-
-
-# ── Letterhead ────────────────────────────────────────────────────────────────
-
-def build_letterhead(styles):
+def _section(title: str) -> list:
     return [
-        HRFlowable(width="100%", thickness=6, color=PRIMARY, spaceAfter=8),
-        Paragraph(NBFC_NAME,    styles['nbfc_name']),
-        Paragraph(NBFC_ADDRESS, styles['nbfc_address']),
-        Paragraph(NBFC_CONTACT, styles['nbfc_address']),
-        Paragraph(NBFC_REG,     styles['nbfc_reg']),
-        HRFlowable(width="100%", thickness=1, color=GREY, spaceBefore=6, spaceAfter=10),
+        Spacer(1, 0.4*cm),
+        Paragraph(title, _style('sec', fontName='Helvetica-Bold',
+                                fontSize=10, textColor=WHITE)),
+        Spacer(1, 0.2*cm),
     ]
 
 
-def build_signature(left_label, right_label, styles):
-    return Table([
-        [Paragraph(left_label,  styles['sign_label']), Paragraph("", styles['sign_label']), Paragraph(right_label, styles['sign_label'])],
-        [Paragraph(NBFC_NAME,   styles['sign_name']),  Paragraph("", styles['sign_label']), Paragraph(NBFC_NAME,   styles['sign_name'])],
-    ], colWidths=[3 * inch, 1 * inch, 3 * inch])
+def _header_bar(title: str, page_w: float) -> Table:
+    t = Table([[Paragraph(title, _style('hb', fontName='Helvetica-Bold',
+                                        fontSize=10, textColor=WHITE,
+                                        alignment=TA_LEFT))]],
+              colWidths=[page_w])
+    t.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,-1), NAVY),
+        ('TOPPADDING',    (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('LEFTPADDING',   (0,0), (-1,-1), 10),
+    ]))
+    return t
 
-def build_footer(styles):
-    return [
-        Spacer(1, 0.3 * inch),
-        HRFlowable(width="100%", thickness=1, color=GREY, spaceAfter=4),
-        Paragraph(f"This is a system-generated document. | {NBFC_NAME} | {NBFC_ADDRESS}", styles['footer_text']),
-    ]
-
-
-# ── Page 1: Loan Closure Certificate ─────────────────────────────────────────
-
-def build_closure_letter(loan, application_id, total_paid, styles, closure_date, issued_date, closed_at):
-    info = loan_info(loan)
-    elements = build_letterhead(styles)
-
-    ref = Table([
-        [Paragraph(f"Ref No: {ref_no('LC', application_id, closed_at + timedelta(days=2))}", styles['ref_line']),
-         Paragraph(f"Date: {issued_date}", styles['ref_line'])]
-    ], colWidths=[3.5 * inch, 3.5 * inch])
-    ref.setStyle(TableStyle([('ALIGN', (1, 0), (1, 0), 'RIGHT')]))
-    elements += [ref, Spacer(1, 0.15 * inch)]
-
-    elements += [
-        Paragraph("LOAN CLOSURE CERTIFICATE", styles['doc_title']),
-        HRFlowable(width="60%", thickness=2, color=PRIMARY, spaceAfter=10, hAlign='CENTER'),
-        Paragraph("To,", styles['body_text']),
-        Paragraph(f"<b>{info['borrower_name']}</b>", styles['body_text']),
-        Spacer(1, 0.05 * inch),
-        Paragraph(f"<b>Subject: Closure of Loan Account No. {application_id}</b>", styles['body_text']),
-        Spacer(1, 0.05 * inch),
-        Paragraph("Dear Sir/Madam,", styles['body_text']),
-        Paragraph(
-            f"We are pleased to inform you that your loan account bearing Loan ID "
-            f"<b>{application_id}</b> has been <b>fully repaid and officially closed</b> "
-            f"as on <b>{closure_date}</b>. We thank you for your timely repayments and for "
-            f"choosing {NBFC_NAME} for your financial needs.",
-            styles['body_text']
-        ),
-    ]
-
-    elements.append(Paragraph("Loan Account Summary", styles['section_header']))
-    summary_table = Table([
-        ["Loan Account Number", str(application_id)],
-        ["Borrower Name",       info['borrower_name']],
-        ["Loan Amount",         f"Rs. {info['loan_amount']}"],
-        ["Total Amount Repaid", f"Rs. {total_paid:.2f}"],
-        ["Closure Date",        closure_date],
-        ["Account Status",      "CLOSED"],
-    ], colWidths=[2.5 * inch, 4.5 * inch])
-    st = base_table_style()
-    st.add('TEXTCOLOR', (1, 5), (1, 5), GREEN)
-    st.add('FONTNAME',  (1, 5), (1, 5), 'Helvetica-Bold')
-    summary_table.setStyle(st)
-    elements += [summary_table, Spacer(1, 0.15 * inch)]
-
-    elements.append(Paragraph("Bank Account Details", styles['section_header']))
-    bank_table = Table([
-        ["Bank Name",      info['bank_name']],
-        ["Account Number", info['account_number']],
-        ["IFSC Code",      info['ifsc_code']],
-        ["Branch",         info['branch_name']],
-    ], colWidths=[2.5 * inch, 4.5 * inch])
-    bank_table.setStyle(base_table_style())
-    elements += [bank_table, Spacer(1, 0.15 * inch)]
-
-    elements += [
-        Paragraph(
-            "You are requested to collect your original documents (if any) from our nearest branch. "
-            "No further dues are outstanding against this loan account.",
-            styles['body_text']
-        ),
-        Spacer(1, 0.2 * inch),
-        build_signature("Authorized Signatory", "Branch Manager", styles),
-        *build_footer(styles),
-    ]
-    return elements
-
-
-# ── Page 2: Credit Bureau Update Notice ──────────────────────────────────────
-
-def build_credit_bureau_letter(loan, application_id, styles, closure_date, issued_date, closed_at):
-    info = loan_info(loan)
-    elements = build_letterhead(styles)
-
-    ref = Table([
-        [Paragraph(f"Ref No: {ref_no('CB', application_id, closed_at + timedelta(days=2))}", styles['ref_line']),
-         Paragraph(f"Date: {issued_date}", styles['ref_line'])]
-    ], colWidths=[3.5 * inch, 3.5 * inch])
-    ref.setStyle(TableStyle([('ALIGN', (1, 0), (1, 0), 'RIGHT')]))
-    elements += [ref, Spacer(1, 0.15 * inch)]
-
-    elements += [
-        Paragraph("CREDIT BUREAU UPDATE NOTICE", styles['doc_title']),
-        HRFlowable(width="60%", thickness=2, color=PRIMARY, spaceAfter=10, hAlign='CENTER'),
-        Paragraph("To,", styles['body_text']),
-        Paragraph(f"<b>{info['borrower_name']}</b>", styles['body_text']),
-        Spacer(1, 0.05 * inch),
-        Paragraph(f"<b>Subject: Credit Bureau Update — Loan Account No. {application_id}</b>", styles['body_text']),
-        Spacer(1, 0.05 * inch),
-        Paragraph("Dear Sir/Madam,", styles['body_text']),
-        Paragraph(
-            f"This is to formally notify you that {NBFC_NAME} has submitted an update to "
-            f"<b>CIBIL (TransUnion)</b>, <b>Experian</b>, <b>Equifax</b>, and "
-            f"<b>CRIF High Mark</b> reflecting the closure of Loan ID <b>{application_id}</b> "
-            f"as on <b>{closure_date}</b>.",
-            styles['body_text']
-        ),
-    ]
-
-    elements.append(Paragraph("Credit Bureau Update Details", styles['section_header']))
-    bureau_table = Table([
-        ["Bureau Name",        "Update Status", "Remarks"],
-        ["CIBIL (TransUnion)", "Submitted",     "Loan marked as CLOSED"],
-        ["Experian",           "Submitted",     "Loan marked as CLOSED"],
-        ["Equifax",            "Submitted",     "Loan marked as CLOSED"],
-        ["CRIF High Mark",     "Submitted",     "Loan marked as CLOSED"],
-    ], colWidths=[2.3 * inch, 2 * inch, 2.7 * inch])
-    bt = base_table_style(header_row=True)
-    bt.add('TEXTCOLOR', (1, 1), (1, -1), GREEN)
-    bt.add('FONTNAME',  (1, 1), (1, -1), 'Helvetica-Bold')
-    bureau_table.setStyle(bt)
-    elements += [bureau_table, Spacer(1, 0.15 * inch)]
-
-    elements += [
-        Paragraph(
-            "Credit bureau records are typically updated within <b>30-45 working days</b>. "
-            "For discrepancies, contact us at <b>support@abcfinance.in</b>.",
-            styles['body_text']
-        ),
-        Spacer(1, 0.2 * inch),
-        build_signature("Authorized Signatory", "Credit Bureau Officer", styles),
-        *build_footer(styles),
-    ]
-    return elements
-
-
-# ── Main Route ────────────────────────────────────────────────────────────────
-
-@router.post("/close/{application_id}")
-def close_loan(application_id: str, db: Session = Depends(get_db)):
-
-    loan = db.query(Loan).filter(Loan.loan_id == application_id).first()
+def _fetch_data(application_id: str, db: Session):
+    loan = db.query(LoanApplication).filter(
+        LoanApplication.id == application_id
+    ).first()
     if not loan:
-        raise HTTPException(status_code=404, detail="Loan not found")
+        raise HTTPException(status_code=404, detail="Loan application not found.")
 
-    if loan.status != "closed":
-        emi_schedule = db.query(EMI_Schedule).filter(
-            EMI_Schedule.application_id == application_id
-        ).all()
-        if not emi_schedule:
-            raise HTTPException(status_code=400, detail="No EMI schedule found")
+    emis = db.query(EMISchedule).filter(
+        EMISchedule.application_id == application_id
+    ).order_by(EMISchedule.emi_number).all()
 
-        scheduled_emi_numbers = {e.emi_number for e in emi_schedule}
+    payments = db.query(Payment_Transaction).filter(
+        Payment_Transaction.application_id == application_id
+    ).order_by(Payment_Transaction.created_at).all()
 
-        payments = db.query(Payment_Transaction).filter(
-            Payment_Transaction.application_id == application_id
-        ).all()
+    lender = db.query(Lender).filter(
+        Lender.user_id == loan.user_id
+    ).first()
 
-        paid_emi_numbers = set()
-        total_paid = 0.0
+    return loan, emis, payments, lender
 
-        for p in payments:
-            total_paid += float(p.amount_paid or 0)
-            if p.emi_number is None:
-                continue
-            elif isinstance(p.emi_number, int):
-                paid_emi_numbers.add(p.emi_number)
-            elif isinstance(p.emi_number, list):
-                paid_emi_numbers.update(p.emi_number)
-            elif isinstance(p.emi_number, str):
-                paid_emi_numbers.update(
-                    int(e.strip()) for e in p.emi_number.split(",") if e.strip().isdigit()
-                )
+@router.get("/loan-closure/pdf", summary="Download Loan Closure Certificate")
+def loan_closure_pdf(application_id: str, db: Session = Depends(get_db)):
+    loan, emis, payments, lender = _fetch_data(application_id, db)
+    unpaid = [e for e in emis if e.status not in ("PAID",)]
+    if unpaid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Loan not fully closed. {len(unpaid)} EMI(s) still pending."
+        )
+    total_principal  = sum(Decimal(str(e.principal_component)) for e in emis)
+    total_interest   = sum(Decimal(str(e.interest_component))  for e in emis)
+    total_gst        = sum(Decimal(str(e.gst_amount))          for e in emis)
+    total_paid       = sum(Decimal(str(p.amount_paid or 0))    for p in payments)
+    last_payment     = payments[-1] if payments else None
+    closure_date     = last_payment.created_at.strftime("%d %b %Y") if last_payment else datetime.now().strftime("%d %b %Y")
+    disburse_date    = loan.disbursed_at.strftime("%d %b %Y") if loan.disbursed_at else "N/A"
+    buffer   = BytesIO()
+    PAGE_W   = A4[0] - 3.6*cm
+    doc      = SimpleDocTemplate(buffer, pagesize=A4,
+                                  leftMargin=1.8*cm, rightMargin=1.8*cm,
+                                  topMargin=1.5*cm,  bottomMargin=1.5*cm)
+    elements = []
 
-        if scheduled_emi_numbers != paid_emi_numbers:
-            raise HTTPException(status_code=400, detail="Loan is not fully paid yet")
+    lender_name = lender.company_name if lender else "LoanApp Pvt. Ltd."
+    lender_addr = lender.address      if lender else ""
+    lender_gst  = lender.gst_number   if lender else ""
 
-        loan.status    = "closed"
-        loan.closed_at = datetime(2026, 9, 26)
-        db.commit()
-    else:
-        # Already closed — just recalculate total_paid for PDF
-        payments = db.query(Payment_Transaction).filter(
-            Payment_Transaction.application_id == application_id
-        ).all()
-        total_paid = sum(float(p.amount_paid or 0) for p in payments)
+    elements.append(Paragraph(lender_name,
+        _style('ln', fontName='Helvetica-Bold', fontSize=18, textColor=NAVY, alignment=TA_CENTER)))
+    if lender_addr:
+        elements.append(Paragraph(lender_addr,
+            _style('la', fontSize=9, textColor=GREY, alignment=TA_CENTER)))
+    if lender_gst:
+        elements.append(Paragraph(f"GST: {lender_gst}",
+            _style('lg', fontSize=8.5, textColor=GREY, alignment=TA_CENTER)))
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=8))
 
-    # ── Build PDF ─────────────────────────────────────────────────────────────
-    styles       = get_styles()
-    closed_at    = datetime(2026, 9, 26)
-    closure_date = format_date(closed_at)                     # 26 September 2026
-    issued_date  = format_date(closed_at + timedelta(days=2)) # 28 September 2026
+    elements.append(Paragraph("LOAN CLOSURE CERTIFICATE",
+        _style('ct', fontName='Helvetica-Bold', fontSize=16,
+               textColor=NAVY, alignment=TA_CENTER)))
+    elements.append(Paragraph("Loan Closure Certificate",
+        _style('nd', fontSize=10, textColor=BLUE, alignment=TA_CENTER)))
+    elements.append(Spacer(1, 0.4*cm))
+    ref_data = [[
+        Paragraph(f"Reference No: <b>{loan.reference_number or application_id}</b>",
+                  _style('ref', fontSize=9, textColor=DARK)),
+        Paragraph(f"Closure Date: <b>{closure_date}</b>",
+                  _style('cd', fontSize=9, textColor=DARK, alignment=TA_RIGHT)),
+    ]]
+    ref_t = Table(ref_data, colWidths=[PAGE_W/2, PAGE_W/2])
+    ref_t.setStyle(TableStyle([
+        ('TOPPADDING',    (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('BACKGROUND',    (0,0), (-1,-1), LIGHT),
+        ('BOX',           (0,0), (-1,-1), 0.5, BORDER),
+    ]))
+    elements.append(ref_t)
+    elements.append(Spacer(1, 0.4*cm))
+    elements.append(_header_bar("  Loan Details", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+    elements.append(_kv_table([
+        ("Application ID",      application_id),
+        ("Reference Number",    loan.reference_number or "N/A"),
+        ("Sanctioned Amount",   _fmt(loan.approved_amount)),
+        ("Interest Rate",       f"{loan.interest_rate or 'N/A'} % p.a."),
+        ("Tenure",              f"{loan.requested_tenure_months or 'N/A'} Months"),
+        ("Monthly EMI",         _fmt(loan.monthly_emi)),
+        ("Disbursement Date",   disburse_date),
+        ("Loan Status",         "CLOSED ✓"),
+    ], col_w=[8*cm, PAGE_W - 8*cm]))
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(_header_bar("  Payment Summary", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+    elements.append(_kv_table([
+        ("Total Principal Repaid",  _fmt(total_principal)),
+        ("Total Interest Paid",     _fmt(total_interest)),
+        ("Total GST Paid",          _fmt(total_gst)),
+        ("Total Amount Paid",       _fmt(total_paid)),
+        ("Number of EMIs",          str(len(emis))),
+        ("Last Payment Date",       closure_date),
+    ], col_w=[8*cm, PAGE_W - 8*cm]))
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(_header_bar("  EMI Payment Ledger", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+    hdr = _style('eh', fontName='Helvetica-Bold', fontSize=8, textColor=WHITE, alignment=TA_CENTER)
+    cel = _style('ec', fontSize=8, textColor=DARK, alignment=TA_CENTER)
+    amts= _style('ea', fontName='Helvetica-Bold', fontSize=8, textColor=GREEN, alignment=TA_RIGHT)
+    emi_headers = [
+        [Paragraph(h, hdr) for h in [
+            "EMI #", "Due Date", "Opening\nPrincipal",
+            "Principal", "Interest", "GST", "EMI Amount",
+            "Closing\nPrincipal", "Status"
+        ]]
+    ]
+    emi_rows = []
+    for e in emis:
+        emi_rows.append([
+            Paragraph(str(e.emi_number),                        cel),
+            Paragraph(e.due_date.strftime("%d %b %Y") if e.due_date else "-", cel),
+            Paragraph(_fmtn(e.opening_principal),               cel),
+            Paragraph(_fmtn(e.principal_component),             cel),
+            Paragraph(_fmtn(e.interest_component),              cel),
+            Paragraph(_fmtn(e.gst_amount),                      cel),
+            Paragraph(_fmtn(e.emi_amount),                      amts),
+            Paragraph(_fmtn(e.closing_principal),               cel),
+            Paragraph("PAID ✓",
+                _style('st', fontName='Helvetica-Bold', fontSize=8,
+                       textColor=GREEN, alignment=TA_CENTER)),
+        ])
 
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=letter,
-        leftMargin=0.75 * inch, rightMargin=0.75 * inch,
-        topMargin=0.5 * inch,   bottomMargin=0.5 * inch,
+    emi_table = Table(
+        emi_headers + emi_rows,
+        colWidths=[1.2*cm, 2.3*cm, 2.3*cm, 2.1*cm, 2.0*cm, 1.8*cm, 2.2*cm, 2.3*cm, 1.8*cm],
+        repeatRows=1
     )
-    doc.build([
-        *build_closure_letter(loan, application_id, total_paid, styles, closure_date, issued_date, closed_at),
-        PageBreak(),
-        *build_credit_bureau_letter(loan, application_id, styles, closure_date, issued_date, closed_at),
-    ])
+    emi_table.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,0),  NAVY),
+        ('LINEBELOW',     (0,0), (-1,0),  1.5, BLUE),
+        ('ROWBACKGROUNDS',(0,1), (-1,-1), [WHITE, ALT]),
+        ('GRID',          (0,0), (-1,-1), 0.4, BORDER),
+        ('TOPPADDING',    (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('LEFTPADDING',   (0,0), (-1,-1), 4),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 4),
+        ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    elements.append(emi_table)
+    elements.append(Spacer(1, 0.5*cm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    elements.append(Spacer(1, 0.2*cm))
+    elements.append(Paragraph(
+        f"This is to certify that the above-mentioned loan (Application ID: {application_id}) "
+        f"has been fully repaid as on <b>{closure_date}</b>. All outstanding dues have been cleared "
+        f"and the loan account is hereby marked as <b>CLOSED</b>. "
+        f"No further amount is payable by the borrower against this loan.",
+        _style('decl', fontSize=8.5, textColor=DARK, leading=14)
+    ))
+    elements.append(Spacer(1, 1.2*cm))
+
+    sig_data = [[
+        Paragraph("____________________\nAuthorized Signatory\n" + lender_name,
+                  _style('sig', fontSize=8.5, textColor=DARK, alignment=TA_CENTER)),
+        Paragraph(f"____________________\nDate: {closure_date}",
+                  _style('sig', fontSize=8.5, textColor=DARK, alignment=TA_CENTER)),
+    ]]
+    sig_t = Table(sig_data, colWidths=[PAGE_W/2, PAGE_W/2])
+    sig_t.setStyle(TableStyle([('TOPPADDING',(0,0),(-1,-1),4)]))
+    elements.append(sig_t)
+
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    elements.append(Paragraph(
+        f"System generated on {datetime.now().strftime('%d %b %Y at %I:%M %p')} · "
+        f"For queries: support@loanapp.com",
+        _style('ft', fontSize=7.5, textColor=GREY, alignment=TA_CENTER)
+    ))
+
+    doc.build(elements)
     buffer.seek(0)
+    return StreamingResponse(buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=loan_closure_{application_id}.pdf"})
 
-    return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=loan_closure_{application_id}.pdf"},
+@router.get("/credit-bureau/pdf", summary="Download Credit Bureau Update Report")
+def credit_bureau_pdf(application_id: str, db: Session = Depends(get_db)):
+    loan, emis, payments, lender = _fetch_data(application_id, db)
+
+    total_emis   = len(emis)
+    paid_emis    = [e for e in emis if e.status == "PAID"]
+    unpaid_emis  = [e for e in emis if e.status != "PAID"]
+    overdue_emis = [e for e in unpaid_emis if e.due_date and e.due_date < datetime.now().date()]
+
+    total_paid      = sum(Decimal(str(p.amount_paid or 0)) for p in payments)
+    total_emi_amt   = sum(Decimal(str(e.emi_amount))        for e in emis)
+    outstanding     = loan.outstanding_amount or sum(
+        Decimal(str(e.emi_amount)) for e in unpaid_emis
     )
+    overdue_amount  = sum(Decimal(str(e.emi_amount)) for e in overdue_emis)
+
+    loan_status = "CLOSED" if not unpaid_emis else ("OVERDUE" if overdue_emis else "ACTIVE")
+    report_date = datetime.now().strftime("%d %b %Y")
+    disburse_date = loan.disbursed_at.strftime("%d %b %Y") if loan.disbursed_at else "N/A"
+
+    buffer  = BytesIO()
+    PAGE_W  = A4[0] - 3.6*cm
+    doc     = SimpleDocTemplate(buffer, pagesize=A4,
+                                 leftMargin=1.8*cm, rightMargin=1.8*cm,
+                                 topMargin=1.5*cm,  bottomMargin=1.5*cm)
+    elements = []
+    elements.append(Paragraph("CREDIT BUREAU UPDATE REPORT",
+        _style('ct', fontName='Helvetica-Bold', fontSize=16,
+               textColor=NAVY, alignment=TA_CENTER)))
+    elements.append(Paragraph("For Official Credit Reporting Purposes",
+        _style('sub', fontSize=9, textColor=GREY, alignment=TA_CENTER)))
+    elements.append(Spacer(1, 0.2*cm))
+    status_color = GREEN if loan_status == "CLOSED" else (AMBER if loan_status == "OVERDUE" else BLUE)
+    ref_data = [[
+        Paragraph(f"Report Date: <b>{report_date}</b>",
+                  _style('r1', fontSize=9)),
+        Paragraph(f"Application ID: <b>{application_id}</b>",
+                  _style('r2', fontSize=9, alignment=TA_CENTER)),
+        Paragraph(f"Loan Status: <b>{loan_status}</b>",
+                  _style('r3', fontSize=9, textColor=status_color, alignment=TA_RIGHT)),
+    ]]
+    ref_t = Table(ref_data, colWidths=[PAGE_W/3]*3)
+    ref_t.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,-1), LIGHT),
+        ('BOX',           (0,0), (-1,-1), 0.5, BORDER),
+        ('TOPPADDING',    (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('LEFTPADDING',   (0,0), (-1,-1), 8),
+    ]))
+    elements.append(ref_t)
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(_header_bar("  Loan Account Details", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+    elements.append(_kv_table([
+        ("Account / Application ID",  application_id),
+        ("Reference Number",          loan.reference_number or "N/A"),
+        ("Loan Type",                 "Personal Loan"),
+        ("Sanctioned Amount",         _fmt(loan.approved_amount)),
+        ("Interest Rate",             f"{loan.interest_rate or 'N/A'} % p.a."),
+        ("Tenure",                    f"{loan.requested_tenure_months or 'N/A'} Months"),
+        ("Disbursement Date",         disburse_date),
+        ("Processing Fee",            _fmt(loan.processing_fee)),
+        ("Total Repayment Amount",    _fmt(loan.total_repayment)),
+        ("Account Status",            loan_status),
+    ], col_w=[8*cm, PAGE_W - 8*cm]))
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(_header_bar("  Repayment Summary", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+    elements.append(_kv_table([
+        ("Total EMIs",                str(total_emis)),
+        ("EMIs Paid",                 str(len(paid_emis))),
+        ("EMIs Pending",              str(len(unpaid_emis))),
+        ("Overdue EMIs",              str(len(overdue_emis))),
+        ("Total Amount Paid",         _fmt(total_paid)),
+        ("Outstanding Amount",        _fmt(outstanding)),
+        ("Overdue Amount",            _fmt(overdue_amount)),
+        ("Last Payment Date",         payments[-1].created_at.strftime("%d %b %Y") if payments else "N/A"),
+    ], col_w=[8*cm, PAGE_W - 8*cm]))
+    if lender:
+        elements.append(Spacer(1, 0.3*cm))
+        elements.append(_header_bar("  Lender / Institution Details", PAGE_W))
+        elements.append(Spacer(1, 0.1*cm))
+        elements.append(_kv_table([
+            ("Institution Name",   lender.company_name),
+            ("GST Number",         lender.gst_number or "N/A"),
+            ("Bank Name",          lender.lender_bank_name),
+            ("Account Number",     lender.lender_account_number),
+            ("IFSC Code",          lender.ifsc),
+            ("Address",            lender.address or "N/A"),
+        ], col_w=[8*cm, PAGE_W - 8*cm]))
+    elements.append(Spacer(1, 0.3*cm))
+    elements.append(_header_bar("  Monthly Payment Track Record", PAGE_W))
+    elements.append(Spacer(1, 0.1*cm))
+
+    hdr  = _style('th', fontName='Helvetica-Bold', fontSize=8, textColor=WHITE, alignment=TA_CENTER)
+    celc = _style('tc', fontSize=8, textColor=DARK, alignment=TA_CENTER)
+    amts = _style('ta', fontName='Helvetica-Bold', fontSize=8, textColor=GREEN, alignment=TA_RIGHT)
+    ovrd = _style('to', fontName='Helvetica-Bold', fontSize=8, textColor=AMBER, alignment=TA_CENTER)
+
+    track_headers = [[
+        Paragraph(h, hdr) for h in [
+            "EMI #", "Due Date", "EMI Amount",
+            "Days Overdue", "Status"
+        ]
+    ]]
+    track_rows = []
+    today = datetime.now().date()
+    for e in emis:
+        is_paid    = e.status == "PAID"
+        is_overdue = not is_paid and e.due_date and e.due_date < today
+        days_over  = (today - e.due_date).days if is_overdue else 0
+        st_style   = _style('ss', fontName='Helvetica-Bold', fontSize=8,
+                             textColor=GREEN if is_paid else (AMBER if is_overdue else BLUE),
+                             alignment=TA_CENTER)
+        track_rows.append([
+            Paragraph(str(e.emi_number),                                  celc),
+            Paragraph(e.due_date.strftime("%d %b %Y") if e.due_date else "-", celc),
+            Paragraph(_fmtn(e.emi_amount),                                amts),
+            Paragraph(str(days_over) if is_overdue else "0",              ovrd if is_overdue else celc),
+            Paragraph("PAID" if is_paid else ("OVERDUE" if is_overdue else "PENDING"), st_style),
+        ])
+
+    track_table = Table(
+        track_headers + track_rows,
+        colWidths=[1.8*cm, 3.2*cm, 3.5*cm, 3.0*cm, 3.0*cm],
+        repeatRows=1
+    )
+    track_table.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,0),  NAVY),
+        ('LINEBELOW',     (0,0), (-1,0),  1.5, BLUE),
+        ('ROWBACKGROUNDS',(0,1), (-1,-1), [WHITE, ALT]),
+        ('GRID',          (0,0), (-1,-1), 0.4, BORDER),
+        ('TOPPADDING',    (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('LEFTPADDING',   (0,0), (-1,-1), 6),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 6),
+        ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    elements.append(track_table)
+    elements.append(Spacer(1, 0.4*cm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    elements.append(Paragraph(
+        f"This report is generated for credit bureau reporting purposes only. "
+        f"Generated on {datetime.now().strftime('%d %b %Y at %I:%M %p')}. "
+        f"Confidential — not for public distribution.",
+        _style('ft', fontSize=7.5, textColor=GREY, alignment=TA_CENTER)
+    ))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=credit_bureau_{application_id}.pdf"})

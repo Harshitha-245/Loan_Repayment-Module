@@ -1,13 +1,22 @@
-from uuid import UUID
+from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
-from .base_schema import BaseSchema
 
 
-class PaymentReminderSettingSchema(BaseSchema):
-    user_id: UUID
-    remind_before_days: int
-    reminder_type: str
-    active: Optional[bool] = True
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+class ReminderLogCreate(BaseModel):
+    user_id: int
+    emi_id: int
+    channel: str
+    status: str
+
+
+class ReminderLogResponse(BaseModel):
+    log_id: int
+    user_id: int
+    emi_id: int
+    channel: str
+    status: str
+    sent_at: datetime
+
+    class Config:
+        orm_mode = True

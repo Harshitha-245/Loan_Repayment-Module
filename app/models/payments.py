@@ -9,14 +9,13 @@ import enum
 class Payment_Transaction(Base):
     __tablename__ = "payments"
 
-    payment_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    application_id = Column(UUID(as_uuid=True), ForeignKey("loans.loan_id"))
-    # emi_id = Column(UUID(as_uuid=True))  # optional
-    emi_number = Column(Integer, nullable=True)# optional
-    # emi_amount = Column(Numeric(12, 2), nullable=True)  # optional, can be derived from EMI schedule
+    payment_id = Column(Integer, primary_key=True)
+    transaction_id = Column(String(12), unique=True, nullable=True)
+    application_id = Column(Integer, ForeignKey("loan_application.id"))
+    emi_number     = Column(String, nullable=True)
     amount_paid = Column(Numeric(12, 2))
-    payment_mode = Column(String(30))            # bank_transfer / upi / credit_card
-    payment_option = Column(String(20))  # manual / auto_debit
+    payment_mode = Column(String(30))           
+    payment_option = Column(String(20))  
     created_at = Column(DateTime, server_default=func.now())
     
 class PaymentModeEnum(str, enum.Enum):
